@@ -1,0 +1,82 @@
+import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { readFileSync } from 'node:fs';
+import { handleArenaRequest } from '../src/worker-handler.js';
+import { ArenaNetwork } from '../public/network/network.js';
+const sqlite = new DatabaseSync(':memory:');
+for (const file of ['0000_known_maelstrom.sql', '0001_parched_queen_noir.sql']) sqlite.exec(readFileSync(new URL('../migrations/' + file, import.meta.url), 'utf8'));
+const DB = {prepare(sql) { let args=[]; return {bind(...values){args=values;return this;},async first(){return sqlite.prepare(sql).get(...args)||null;},async all(){return {results:sqlite.prepare(sql).all(...args)};},async run(){return {meta:{changes:Number(sqlite.prepare(sql).run(...args).changes)}};}};},async batch(statements){sqlite.exec('BEGIN');try {const r=[];for(const s of statements)r.push(await s.run());sqlite.exec('COMMIT');return r;}catch(e){sqlite.exec('ROLLBACK');throw e;}}};
+let tests = 0;
+function check(value,label){assert.ok(value,label);tests++;}
+async function call(path,method='GET',body,session,extra={}) {
+  const headers = {...extra}; if(body!==undefined)headers['content-type']='application/json';
+  if(session){headers['x-arena-peer']=session.selfId;headers.authorization='Bearer '+session.token;}
+  const request = new Request('https://arena.example/api/arena/rooms'+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body)});
+  const response=await handleArenaRequest(request,{DB});return {status:response.status,data:await response.json()};
+}
+const hostRes=await call('','POST',{name:'<Captain>\n'}), host=hostRes.data;
+check(hostRes.status===200&&host.isHost===undefined&&host.selfId===host.hostId,'create room');
+check(host.peers[0].name==='Captain','name sanitized');
+check(/^[A-Z2-9]{8}$/.test(host.code),'eight-character code');
+check(sqlite.prepare('SELECT token_hash FROM arena_members').get().token_hash!==host.token,'token hashed at rest');
+const members=[host];
+for(let i=0;i<5;i++){const r=await call('/'+host.code+'/join','POST',{name:'Player '+i});check(r.status===200,'join member '+i);members.push(r.data);}
+check((await call('/'+host.code+'/join','POST',{name:'Overflow'})).status===409,'six-player cap');
+check((await call('/'+host.code+'/poll')).status===401,'auth required');
+check((await call('/'+host.code+'/poll','GET',undefined,{...host,token:'f'.repeat(64)})).status===401,'wrong token rejected');
+const guest=members[1];
+check((await call('/'+host.code+'/signal','POST',{to:guest.selfId,kind:'offer',payload:{sid:'test',description:{type:'offer',sdp:'test'}}},host)).status===200,'signal accepted');
+const poll=await call('/'+host.code+'/poll','GET',undefined,guest);
+check(poll.data.signals.length===1&&poll.data.signals[0].sender===host.selfId,'recipient receives signal');
+check((await call('/'+host.code+'/poll','GET',undefined,members[2])).data.signals.length===0,'signal isolated from other members');
+check((await call('/'+host.code+'/poll?after='+poll.data.signals[0].id,'GET',undefined,guest)).data.signals.length===0,'cursor suppresses replay');
+check((await call('/'+host.code+'/signal','POST',{to:guest.selfId,kind:'offer',payload:{x:'x'.repeat(24500)}},host)).status===400,'signal size cap');
+check((await call('/'+host.code+'/signal','POST',{to:guest.selfId,kind:'offer',payload:{x:'x'.repeat(29000)}},host)).status===413,'request size cap');
+check((await call('','POST',{},undefined,{origin:'https://evil.example'})).status===403,'cross-origin rejected');
+check((await call('/'+host.code+'/signal','POST',{to:host.selfId,kind:'offer',payload:{}},host)).status===400,'self target rejected');
+const outsider=(await call('','POST',{name:'Other room'})).data;
+check((await call('/'+host.code+'/signal','POST',{to:outsider.selfId,kind:'offer',payload:{}},host)).status===404,'cross-room target rejected');
+const snapshot={players:{[host.selfId]:{id:host.selfId,x:10,y:20,hp:100}},walls:[],bullets:[],time:1};
+check((await call('/'+host.code+'/exchange','POST',{snapshot,seq:1},host)).status===200,'host relay snapshot accepted');
+const relayGuest=await call('/'+host.code+'/exchange','POST',{input:{mx:9,my:0,angle:1,fire:true},seq:1},guest);
+check(relayGuest.status===200&&relayGuest.data.snapshot.players[host.selfId].x===10,'guest relay receives actual host snapshot');
+check((await call('/'+host.code+'/exchange','POST',{input:{mx:0,my:0,angle:0},seq:2},guest)).status===429,'relay rate limited');
+sqlite.prepare('UPDATE arena_members SET last_exchange_at=0 WHERE room_code=?').run(host.code);
+const relayHost=await call('/'+host.code+'/exchange','POST',{},host);
+check(relayHost.data.inputs.find(p=>p.id===guest.selfId).input.mx===1,'host receives clamped guest input');
+check((await call('/'+host.code+'/exchange','POST',{snapshot,seq:2},guest)).status===403,'guest cannot publish world state');
+sqlite.prepare('UPDATE arena_members SET last_exchange_at=0 WHERE room_code=?').run(host.code);
+check((await call('/'+host.code+'/exchange','POST',{snapshot:{...snapshot,bullets:Array(401).fill({})},seq:2},host)).status===400,'relay snapshot bounds');
+check((await call('/'+host.code+'/exchange','POST',{})).status===401,'relay authentication required');
+check((await call('/'+host.code+'/leave','POST',{},members[5])).status===200,'guest leave');
+check((await call('/'+host.code+'/join','POST',{name:'Replacement'})).status===200,'vacated slot join');
+sqlite.prepare('UPDATE arena_members SET last_seen=? WHERE room_code=? AND peer_id=?').run(Date.now()-46000,host.code,guest.selfId);
+check((await call('/'+host.code+'/poll','GET',undefined,guest)).status===401,'expired member denied');
+check((await call('/'+host.code+'/leave','POST',{},host)).status===200,'host leave');
+check((await call('/'+host.code+'/poll','GET',undefined,members[2])).status===410,'host departure ends room');
+sqlite.prepare('UPDATE arena_rooms SET expires_at=? WHERE code=?').run(Date.now()-1,outsider.code);
+check((await call('/'+outsider.code+'/join','POST',{})).status===410,'room expiry');
+
+// Deterministic client transport / proximity checks. No browser microphone is opened here.
+const received=[]; const net=new ArenaNetwork({onInput:(id,value)=>received.push({id,value})});
+net.selfId='a'.repeat(32);net.hostId=net.selfId;net.isHost=true;
+net.updatePositions([{id:net.selfId,x:0,y:0,hp:100},{id:'b'.repeat(32),x:260,y:0,hp:100},{id:'c'.repeat(32),x:600,y:0,hp:100}]);
+check(net._gainFor('b'.repeat(32))===0.25,'distance attenuation');
+check(net._gainFor('c'.repeat(32))===0,'far peer silent');
+check(net._gainFor('d'.repeat(32))===0,'unknown position silent');
+net.positions.get('b'.repeat(32)).hp=0;check(net._gainFor('b'.repeat(32))===0,'dead peer silent');
+net.positions.get('b'.repeat(32)).hp=100;
+const mic={enabled:false};net.links.set('b'.repeat(32),{micTrack:mic});net.voiceEnabled=true;net.setTalking(true);check(mic.enabled,'near peer PTT enables cloned track');
+net.setTalking(false);check(!mic.enabled,'PTT release disables cloned track');
+net.links.clear();
+const channel={readyState:'open',bufferedAmount:0,send:value=>received.push(JSON.parse(value))};
+const link={id:'b'.repeat(32),channel};net._bindChannel(link,channel);net.links.set(link.id,link);
+channel.onmessage({data:JSON.stringify({type:'input',seq:1,value:{mx:100,my:-100,angle:1,fire:true}})});
+check(received[0].value.mx===1&&received[0].value.my===-1,'remote input clamped');
+channel.onmessage({data:JSON.stringify({type:'input',seq:2,value:{mx:'bad',my:0,angle:1}})});check(received.length===1,'invalid input rejected');
+net.broadcastSnapshot({tick:1});check(received[1].type==='snapshot','host snapshot sends');
+channel.bufferedAmount=200000;check(!net._send(link.id,{type:'snapshot',value:{}}),'backpressure drops stale state');
+let accepted=0;net.isHost=false;net.hostId='e'.repeat(32);net.onSnapshot=()=>accepted++;
+channel.onmessage({data:JSON.stringify({type:'snapshot',value:{}})});check(accepted===0,'nonhost snapshots ignored');
+net.links.clear();net.leave(false);check(!net.token&&!net.selfId&&!net.voiceEnabled,'leave clears session');
+console.log(`PASS: ${tests} signaling, authorization, capacity, TTL, transport and proximity checks.`);

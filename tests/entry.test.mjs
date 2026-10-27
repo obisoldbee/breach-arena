@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import worker from '../src/index.js';
+const redirect = await worker.fetch(new Request('https://arena.example/'), {});
+assert.equal(redirect.status, 302);
+assert.equal(redirect.headers.get('location'), 'https://arena.example/game/index.html');
+const asset = await worker.fetch(new Request('https://arena.example/game/index.html'), { ASSETS: { fetch: () => new Response('asset') } });
+assert.equal(await asset.text(), 'asset');
+const missing = await worker.fetch(new Request('https://arena.example/api/arena/unknown'), { DB: {} });
+assert.equal(missing.status, 404);
+console.log('PASS standalone entry: redirect, static dispatch, API dispatch');
